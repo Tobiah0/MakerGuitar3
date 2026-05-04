@@ -1,26 +1,30 @@
 import serial
 import mido
+import time
 
 # --- MAC CONFIGURATION ---
-# Replace this with your exact ESP32 port (e.g., '/dev/cu.usbserial-0001')
-SERIAL_PORT = '/dev/cu.wchusbserial110' 
-BAUD_RATE = 115200
-
-# The default name for the Mac IAC Driver port
+SERIAL_PORT = '/dev/cu.wchusbserial10' 
+BAUD_RATE = 460800
 MIDI_PORT_NAME = 'IAC Driver Bus 1' 
 
 def main():
     print("Available MIDI Outputs:")
-    for name in mido.get_output_names():
+    for name in mido.get_output_names(): # type: ignore
         print(f" - {name}")
     print("-" * 20)
 
     try:
-        ser = serial.Serial(SERIAL_PORT, BAUD_RATE)
+        # Open serial but prevent the ESP32 from getting stuck in a reset loop
+        ser = serial.Serial()
+        ser.port = SERIAL_PORT
+        ser.baudrate = BAUD_RATE
+        ser.setDTR(False) 
+        ser.setRTS(False) 
+        ser.open()
+        
         print(f"Listening to Makerboard on {SERIAL_PORT}...")
 
-        # Find the IAC Driver port
-        target_port = next((port for port in mido.get_output_names() if MIDI_PORT_NAME in port), None)
+        target_port = next((port for port in mido.get_output_names() if MIDI_PORT_NAME in port), None) # type: ignore
         
         if not target_port:
              print(f"Error: Could not find '{MIDI_PORT_NAME}'. Did you enable it in Audio MIDI Setup?")
@@ -31,13 +35,17 @@ def main():
             print("Ready to play! Press Ctrl+C to stop.\n")
 
             while True:
-                # Read the incoming text from the ESP32
                 if ser.in_waiting > 0:
                     try:
-                        # Decode the serial bytes into a standard text string
-                        line = ser.readline().decode('utf-8').strip()
+                        # Read the raw bytes
+                        raw_line = ser.readline()
                         
-                        # Check if the string matches our "ACTION,NOTE" format
+                        # Decode and strip
+                        line = raw_line.decode('utf-8').strip()
+                        
+                        # DIAGNOSTIC: Print literally everything we receive
+                        print(f"[RAW SERIAL] {line}")
+                        
                         if "," in line:
                             action, note_str = line.split(",")
                             note = int(note_str)
@@ -45,15 +53,15 @@ def main():
                             if action == "ON":
                                 msg = mido.Message('note_on', note=note, velocity=127)
                                 midi_out.send(msg)
-                                print(f"Strum: Note {note} ON")
+                                print(f"🎵 Strum: Note {note} ON")
                                 
                             elif action == "OFF":
                                 msg = mido.Message('note_off', note=note, velocity=0)
                                 midi_out.send(msg)
-                                print(f"Mute: Note {note} OFF")
+                                print(f"🔇 Mute: Note {note} OFF")
+                                
                     except Exception as e:
-                        # Catch any garbled serial data while plugging in
-                        pass
+                        print(f"[DEBUG ERROR] Could not parse data: {e}")
 
     except serial.SerialException:
         print(f"Error: Could not open {SERIAL_PORT}. Is the PlatformIO Serial Monitor closed?")
