@@ -1,31 +1,51 @@
-#include <Wire.h>
-#include "Adafruit_MPR121.h"
+#include <Arduino.h>
 
-Adafruit_MPR121 neckSensor = Adafruit_MPR121();
-
-// Track the overall state of the sensor
-uint16_t lastTouched = 0;
-
-// If a pin's filtered value drops below this, we consider it touched
-// We know untouched is ~22 and touched is ~3, so 10 is a safe midpoint
-#define TOUCH_THRESHOLD 10
-
-// MIDI note mapping for each fret (pins 0-11)
-// CAN ALWAYS CHANGE (TBD) , lets say we want to play a song or sum.
-const int MIDI_NOTES[12] = {
-  40, // Pin 0  = E2
-  43, // Pin 1  = G2
-  45, // Pin 2  = A2
-  47, // Pin 3  = B2
-  50, // Pin 4  = D3
-  52, // Pin 5  = E3
-  55, // Pin 6  = G3
-  57, // Pin 7  = A3
-  59, // Pin 8  = B3
-  62, // Pin 9  = D4
-  64, // Pin 10 = E4
-  67  // Pin 11 = G4
+// 8 fret pads using ESP32 built-in capacitive touch.
+// These are the GPIO numbers behind the T0, T3-T9 pads on the makerboard.
+const int FRET_PINS[8] = {
+  4,   // Fret 1 (T0)
+  15,  // Fret 2 (T3)
+  13,  // Fret 3 (T4)
+  12,  // Fret 4 (T5)
+  14,  // Fret 5 (T6)
+  27,  // Fret 6 (T7)
+  33,  // Fret 7 (T8)
+  32   // Fret 8 (T9)
 };
+
+// 6 string buttons on non-touch pins
+const int STRING_BUTTONS[6] = {
+  21, // String 0 (low E)  - SDA
+  22, // String 1 (A)      - SCL
+  18, // String 2 (D)      - SCK
+  19, // String 3 (G)      - MISO
+  23, // String 4 (B)      - MOSI
+  26  // String 5 (high E) - A19
+};
+
+// Standard guitar tuning (low to high)
+const int STRING_NOTES[6] = {
+  40, // String 0 (low E)  = E2
+  45, // String 1 (A)      = A2
+  50, // String 2 (D)      = D3
+  55, // String 3 (G)      = G3
+  59, // String 4 (B)      = B3
+  64  // String 5 (high E) = E4
+};
+
+// Auto-calibrated baseline value for each fret (measured at startup).
+// A fret is considered touched when its reading drops noticeably below baseline.
+int fretBaseline[8];
+
+// How much below baseline counts as a touch (0.6 = touched if reading < 60% of baseline)
+#define TOUCH_RATIO 0.6
+
+// Track each button's pressed state and which note each string is currently playing
+bool buttonPressed[6] = {false, false, false, false, false, false};
+int playingNote[6] = {-1, -1, -1, -1, -1, -1};
+
+// Track fret state so we can print only on changes
+bool fretTouched[8] = {false, false, false, false, false, false, false, false};
 
 void setup() {
   Serial.begin(115200);
@@ -33,52 +53,102 @@ void setup() {
 
   Serial.println("\n--- Starting MakerGuitar ---");
 
-  // Initialize the MPR121
-  if (!neckSensor.begin(0x5A)) {
-    Serial.println("ERROR: MPR121 not found! Check your I2C wiring.");
-    while (1); // Halt the board here if sensor fails
+  // Set up button pins as inputs with internal pull-up resistors.
+  for (int i = 0; i < 6; i++) {
+    pinMode(STRING_BUTTONS[i], INPUT_PULLUP);
   }
 
-  Serial.println("SUCCESS: MPR121 found! Go ahead and touch a fret.");
+  // Calibrate each fret's baseline by averaging 20 readings.
+  // Make sure no fingers are on the pads during this!
+  Serial.println("Calibrating frets... DON'T touch the pads!");
+  delay(1000);
+  for (int i = 0; i < 8; i++) {
+    long sum = 0;
+    for (int j = 0; j < 20; j++) {
+      sum += touchRead(FRET_PINS[i]);
+      delay(10);
+    }
+    fretBaseline[i] = sum / 20;
+    Serial.print("Fret ");
+    Serial.print(i);
+    Serial.print(" baseline = ");
+    Serial.println(fretBaseline[i]);
+  }
+  Serial.println("Ready!");
+}
 
-  neckSensor.setThresholds(2, 1);
+// Returns true if fret i is currently being touched
+bool isFretTouched(int i) {
+  return touchRead(FRET_PINS[i]) < fretBaseline[i] * TOUCH_RATIO;
+}
+
+// Find the highest fret pad currently touched (closest to guitar body)
+// Returns the fret number (0-7), or -1 if no fret is held
+int getCurrentFret() {
+  for (int i = 7; i >= 0; i--) {
+    if (isFretTouched(i)) {
+      return i;
+    }
+  }
+  return -1;
 }
 
 void loop() {
-  // Ignore the first 2 seconds after boot so the MPR121 baseline can settle.
-  // Without this, pins briefly cross the threshold during calibration and fire
-  // phantom touches as soon as the program starts.
-  if (millis() < 2000) {
-    return;
-  }
-
-  // checking filteredData directly,
-  // since touched() seems to be missing signals despite clear value drops
-  uint16_t currentTouched = 0;
-  for (int i = 0; i < 12; i++) {
-    if (neckSensor.filteredData(i) < TOUCH_THRESHOLD) {
-      currentTouched |= (1 << i);
+  // Track each fret individually and print when state changes
+  for (int i = 0; i < 8; i++) {
+    bool nowTouched = isFretTouched(i);
+    if (nowTouched && !fretTouched[i]) {
+      Serial.print("FRET ");
+      Serial.print(i);
+      Serial.println(" TOUCHED");
+      fretTouched[i] = true;
+    } else if (!nowTouched && fretTouched[i]) {
+      Serial.print("FRET ");
+      Serial.print(i);
+      Serial.println(" RELEASED");
+      fretTouched[i] = false;
     }
   }
 
-  // Only send serial messages if the state actually changed
-  if (currentTouched != lastTouched) {
-    for (int i = 0; i < 12; i++) {
-      bool wasTouched = (lastTouched >> i) & 1;
-      bool isTouched  = (currentTouched >> i) & 1;
+  // Check each button (string) for press/release events
+  for (int s = 0; s < 6; s++) {
+    // INPUT_PULLUP means LOW = pressed, HIGH = released
+    bool currentlyPressed = (digitalRead(STRING_BUTTONS[s]) == LOW);
 
-      if (!wasTouched && isTouched) {
-        // Fret just pressed 
-        Serial.print("ON,");
-        Serial.println(MIDI_NOTES[i]);
-      } else if (wasTouched && !isTouched) {
-        // Fret just released
+    if (currentlyPressed && !buttonPressed[s]) {
+      // Button just pressed -- figure out what note this string should play.
+      // No fret held = open string (just the base note).
+      // Fret held    = base note + (fret position + 1) semitones.
+      int fret = getCurrentFret();
+      int note = STRING_NOTES[s] + (fret >= 0 ? fret + 1 : 0);
+
+      Serial.print("BUTTON ");
+      Serial.print(s);
+      Serial.print(" PRESSED (fret=");
+      Serial.print(fret);
+      Serial.print(", note=");
+      Serial.print(note);
+      Serial.println(")");
+
+      Serial.print("ON,");
+      Serial.println(note);
+
+      playingNote[s] = note;
+      buttonPressed[s] = true;
+    }
+    else if (!currentlyPressed && buttonPressed[s]) {
+      if (playingNote[s] != -1) {
+        Serial.print("BUTTON ");
+        Serial.print(s);
+        Serial.println(" RELEASED");
+
         Serial.print("OFF,");
-        Serial.println(MIDI_NOTES[i]);
+        Serial.println(playingNote[s]);
+        playingNote[s] = -1;
       }
+      buttonPressed[s] = false;
     }
-    lastTouched = currentTouched;
   }
 
-  delay(50); // Small delay for stability
+  delay(10); // Small delay for stability and rough button debouncing
 }
